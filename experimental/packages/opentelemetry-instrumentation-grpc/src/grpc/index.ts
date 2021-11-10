@@ -40,7 +40,11 @@ import {
   shouldNotTraceServerCall,
   serverStreamAndBidiHandler,
 } from './serverUtils';
-import { makeGrpcClientRemoteCall, getMetadata } from './clientUtils';
+import {
+  makeGrpcClientRemoteCall,
+  getMetadata,
+  getMethodsToWrap,
+} from './clientUtils';
 import { _methodIsIgnored } from '../utils';
 import { AttributeNames } from '../enums/AttributeNames';
 
@@ -86,6 +90,14 @@ export class GrpcNativeInstrumentation extends InstrumentationBase<
             moduleExports,
             'makeGenericClientConstructor',
             this._patchClient()
+          );
+          if (isWrapped(moduleExports.loadPackageDefinition)) {
+            this._unwrap(moduleExports, 'loadPackageDefinition');
+          }
+          this._wrap(
+            moduleExports,
+            'loadPackageDefinition',
+            this._patchLoadPackageDefinition(moduleExports)
           );
           return moduleExports;
         },
@@ -281,6 +293,28 @@ export class GrpcNativeInstrumentation extends InstrumentationBase<
     return methodList;
   }
 
+  /**
+   * Entry point for client patching for grpc.loadPackageDefinition(...)
+   * @param this - GrpcJsPlugin
+   */
+  private _patchLoadPackageDefinition(grpcClient: typeof grpcTypes) {
+    const instrumentation = this;
+    instrumentation._diag.debug('patching loadPackageDefinition');
+    return (original: typeof grpcTypes.loadPackageDefinition) => {
+      return function patchedLoadPackageDefinition(
+        this: null,
+        packageDef: grpcTypes.PackageDefinition
+      ) {
+        const result: grpcTypes.GrpcObject = original.call(
+          this,
+          packageDef
+        ) as grpcTypes.GrpcObject;
+        instrumentation._patchLoadedPackage(grpcClient, result);
+        return result;
+      } as typeof grpcTypes.loadPackageDefinition;
+    };
+  }
+
   private _getPatchedClientMethods() {
     const instrumentation = this;
     return (original: GrpcClientFunc) => {
@@ -306,5 +340,41 @@ export class GrpcNativeInstrumentation extends InstrumentationBase<
         );
       };
     };
+  }
+
+  /**
+   * Utility function to patch *all* functions loaded through a proto file.
+   * Recursively searches for Client classes and patches all methods, reversing the
+   * parsing done by grpc.loadPackageDefinition
+   * https://github.com/grpc/grpc-node/blob/1d14203c382509c3f36132bd0244c99792cb6601/packages/grpc-js/src/make-client.ts#L200-L217
+   */
+  private _patchLoadedPackage(
+    grpcClient: typeof grpcTypes,
+    result: grpcTypes.GrpcObject
+  ): void {
+    Object.values(result).forEach((service) => {
+      if (typeof service === 'function') {
+        this._massWrap(
+          service.prototype as never,
+          getMethodsToWrap.call(
+            this,
+            service,
+            (
+              service as typeof grpcTypes.Client & {
+                service: { [k: string]: { originalName: string } };
+              }
+            ).service
+          ) as never[],
+          this._getPatchedClientMethods.call(this) as any
+        );
+      } else if (typeof service.format !== 'string') {
+        // GrpcObject
+        this._patchLoadedPackage.call(
+          this,
+          grpcClient,
+          service as grpcTypes.GrpcObject
+        );
+      }
+    });
   }
 }

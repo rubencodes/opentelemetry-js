@@ -16,6 +16,7 @@
 
 import type * as grpcTypes from 'grpc';
 import type * as events from 'events';
+import { GrpcNativeInstrumentation } from './';
 import { SendUnaryDataCallback, GrpcClientFunc } from './types';
 import { SemanticAttributes } from '@opentelemetry/semantic-conventions';
 import {
@@ -29,9 +30,40 @@ import {
 import {
   _grpcStatusCodeToSpanStatus,
   _grpcStatusCodeToOpenTelemetryStatusCode,
+  _methodIsIgnored,
   findIndex,
 } from '../utils';
 import { AttributeNames } from '../enums/AttributeNames';
+
+/**
+ * Parse a package method list and return a list of methods to patch
+ * with both possible casings e.g. 'TestMethod' & 'testMethod'
+ */
+export function getMethodsToWrap(
+  this: GrpcNativeInstrumentation,
+  client: typeof grpcTypes.Client,
+  methods: { [key: string]: { originalName?: string } }
+): string[] {
+  const methodList: string[] = [];
+
+  // For a method defined in .proto as 'UnaryMethod'
+  Object.entries(methods).forEach(([name, { originalName }]) => {
+    if (!_methodIsIgnored(name, this.getConfig().ignoreGrpcMethods)) {
+      methodList.push(name); // adds camel case method name: 'unaryMethod'
+      if (
+        originalName &&
+        // eslint-disable-next-line no-prototype-builtins
+        client.prototype.hasOwnProperty(originalName) &&
+        name !== originalName // do not add duplicates
+      ) {
+        // adds original method name: 'UnaryMethod',
+        methodList.push(originalName);
+      }
+    }
+  });
+
+  return methodList;
+}
 
 /**
  * This method handles the client remote call
